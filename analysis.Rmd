@@ -1,0 +1,579 @@
+---
+title: "Analysis"
+author: "MIS COVID Task Force"
+date: "4/3/2020"
+output: html_document
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r, include=FALSE, echo=FALSE}
+library(tidyverse)
+library(lubridate)
+
+source("utils/covid.R")
+source("utils/tex.R")
+source("utils/plotting.R")
+source("utils/bayes.R")
+```
+
+
+## Data
+
+```{r}
+df_pp <- read_csv("data/data_preprocessed.csv") 
+stanDat_main <- make_stan_dat()
+```
+
+
+## Model
+
+Load fit of the main model. To fit the model, run main.r.
+
+```{r}
+# Already fitted model
+main_fit <- readRDS("fitted-models/base.rds")
+
+# Main parameters of interes
+main_fit$summary(c("mu_p_in", "sigma_p_in", "theta", "alpha_0", "phi_new_infections", "phi_new_cases", "lambda"))
+
+# NPI names
+npi_var <- as.character(1:7)
+npi_names <- c("School closure", "Border closure", "Event ban", 
+               "Gathering ban", "Venue closure", "Stay-at-home order", "Work ban")
+names(npi_names) <- npi_var
+npi_ranking <- rank(main_fit$summary(c("theta"))[["mean"]])
+names(npi_ranking) <- npi_names
+
+# Country x Country ID mapping
+cid_country <- df_pp %>% group_by(country) %>% slice(1) %>% ungroup %>% dplyr::select(country, country_id)
+
+# Choose credible interval for reporting
+ci_interval <- mean_qi
+```
+
+## Main results
+
+### NPIs 
+
+#### Individual effects
+
+```{r}
+# NPI effect estimates (theta_m)
+npi_main <- gather_draws(main_fit, theta[measure]) 
+
+npi_main %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) %>%
+  ci_interval() %>%
+  arrange(desc(.value)) %>%
+  mutate_if(is.numeric, function(x) round(x * 100)) %>%
+  dplyr::select(measure, .lower, .value, .upper)
+
+# Plot results
+npi_pl <- npi_main %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! ifelse(npi_names == "Stay-at-home order", "\\hphantom{S}Stay-at-home order", npi_names)))) %>%
+  rename(reduction = .value) %>%
+  ggplot(aes(y = reorder(measure, reduction), x = reduction)) +
+  stat_pointintervalh(point_interval = ci_interval, shape = 21, fill = "grey", color = "black", point_size = 2) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dotted") +
+  scale_x_continuous(expand = c(0,0), limits = c(NA, .77), labels = function(x) x * 100, breaks = seq(0,  1, .25)) +
+  labs(x = "Estimated reduction (\\%)",
+       y = "NPI") +
+  theme_nature() +
+  theme(axis.title.y = element_blank())
+
+save_plot(npi_pl, "results/npi_effects.pdf", "results/npi_effects.tex")
+```
+
+#### Posterior ranking
+
+```{r}
+main_ranks <- npi_main %>%
+  ungroup() %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) %>%
+  mutate(.draw = rep(1:4000, 7)) %>%
+  group_by(.draw) %>%
+  mutate(est_rank = rank(-.value, ties = "first")) %>%
+  ungroup() %>%
+  group_by(measure, est_rank) %>%
+  summarize(share_rank = n() / 4000 * 100) %>%
+  ungroup() %>%
+  mutate(measure = recode(measure, !!! npi_names)) %>%
+  mutate(measure_order = recode(measure, !!! npi_ranking)) %>%
+  mutate(est_rank = factor(est_rank, level = rev(as.character(1:length(npi_names)))))
+
+ranks_pl <- main_ranks %>%
+  mutate(measure = as.factor(ifelse(as.character(measure) == "Stay-at-home order", "\\hphantom{S}Stay-at-home order", as.character(measure)))) %>%
+  ggplot(aes(y = reorder(measure, measure_order), x = share_rank, fill = est_rank)) +
+  geom_bar(position = "stack", stat = "identity") +
+  geom_vline(aes(xintercept = 50), linetype = "dashed") +
+  scale_fill_brewer() +
+  labs(y = "", x = "Estimated proportion (\\%)", fill = "Rank") +
+  theme_nature() +
+  theme(axis.title.y = element_blank(), legend.position = "bottom", legend.margin = unit(0,"cm")) +
+  guides(fill = guide_legend(nrow = 1, byrow = T, reverse = T, keywidth = unit(0.4, "line"), keyheight = unit(0.2, "line")))
+
+save_plot(ranks_pl, "results/npi_ranking.pdf", "results/npi_ranking.tex")
+```
+
+#### Combined effects
+
+```{r}
+# Total effect
+npi_tot <- npi_main %>%
+  ungroup() %>%
+  group_by(.draw) %>%
+  mutate(.value = 1 - .value) %>%
+  summarize(.value = 1 - prod(.value)) %>%
+  ungroup() %>%
+  ci_interval()
+npi_tot
+
+
+# Number of effects greater 0 and 10 %
+npi_k <- npi_main %>%
+  ungroup() %>%
+  group_by(.draw) %>%
+  summarize(k0 = sum(.value > 0),
+            k10 = sum(.value > 0.1)) %>%
+  ungroup() 
+
+# Summarize proportion >0
+npi_prob_0 <- npi_k %>%
+  group_by(k0) %>%
+  summarize(prob = n() / 4000 * 100) %>%
+  ungroup() %>%
+  arrange(desc(k0)) %>%
+  mutate(prob = cumsum(prob))
+npi_prob_0 <- rbind(npi_prob_0, data.frame(k0 = c(1, 2), prob = c(100, 100)))
+
+
+# Plot >0
+npi_prob_0_pl <- npi_prob_0 %>%
+  ggplot(aes(y = factor(k0), x = prob)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(y = k0, x = prob + 5, label = round_k(prob, 0)), color = "black", size = 8 / cm(1)) +
+  geom_vline(aes(xintercept = 50), linetype = "dashed") +
+  scale_x_continuous(expand = c(0,0), limits = c(0,120), breaks = seq(0, 120, 25)) +
+  labs(y = "$m$ effects > 0\\%", x = "Estimated proportion (\\%)") +
+  theme_nature() 
+
+npi_prob_0_pl
+save_plot(npi_prob_0_pl, "results/npi_prob_0.pdf", "results/npi_prob_0.tex")
+
+# Summarize proportion >10
+npi_prob_10 <- npi_k %>%
+  group_by(k10) %>%
+  summarize(prob = n() / 4000 * 100) %>%
+  ungroup() %>%
+  arrange(desc(k10)) %>%
+  mutate(prob = cumsum(prob))
+npi_prob_10 <- rbind(npi_prob_10, data.frame(k10 = c(1, 7), prob = c(100, 0)))
+
+# Plot >10
+npi_prob_10_pl <- npi_prob_10 %>%
+  ggplot(aes(y = factor(k10), x = prob)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(y = k10, x = prob + 5, label = round_k(prob, 0)), color = "black", size = 8 / cm(1)) +
+  geom_vline(aes(xintercept = 50), linetype = "dashed") +
+  scale_x_continuous(expand = c(0,0), limits = c(0,120), breaks = seq(0, 120, 25)) +
+  labs(y = "$m$ effects > 10\\%", x = "Estimated proportion (\\%)") +
+  theme_nature() 
+
+npi_prob_10_pl
+save_plot(npi_prob_10_pl, "results/npi_prob_10.pdf", "results/npi_prob_10.tex")
+```
+
+### Model fit
+
+```{r}
+expected_N <- gather_draws(main_fit, E_new_cases_rep[day, country])
+expected_I <- gather_draws(main_fit, E_new_infections_rep[day, country])
+
+pdf("results/compartments.pdf", width = 12 / cm(1), height = 10 / cm(1))
+for (i in cid_country$country_id) {
+  print(plot_compartments(cid_country$country[i], stanDat_main, expected_N, expected_I))
+}
+dev.off()
+```
+
+## Detailed estimation results
+
+### Parameter estimates
+
+```{r}
+# Parameter estimates
+alpha_0_ci <- gather_draws(main_fit, alpha_0) %>% ci_interval()
+tau_ci <- gather_draws(main_fit, tau) %>% ci_interval()
+alpha_j_ci <- gather_draws(main_fit, alpha_j[j]) %>% ci_interval()
+theta_ci <- gather_draws(main_fit, theta[m]) %>% ci_interval()
+lambda_ci <- gather_draws(main_fit, lambda) %>% ci_interval()
+I0_ci <- gather_draws(main_fit, new_infections_EpiStart[j]) %>% ci_interval()
+phi_new_cases_ci <- gather_draws(main_fit, phi_new_cases) %>% ci_interval()
+phi_new_infections_ci <- gather_draws(main_fit, phi_new_infections) %>% ci_interval()
+mu_p_in_ci <- gather_draws(main_fit, mu_p_in) %>% ci_interval() 
+sigma_p_in_ci <- gather_draws(main_fit, sigma_p_in) %>% ci_interval()
+
+par_est <- map_dfr(list(alpha_0_ci, tau_ci, alpha_j_ci, theta_ci, lambda_ci, I0_ci, phi_new_cases_ci, phi_new_infections_ci, mu_p_in_ci, sigma_p_in_ci),
+                  function(par) data.frame(mean = par$.value, lower = par$.lower, upper = par$.upper))
+
+
+# Neff Ratio
+par_est$neff_ratio <- c(
+  main_fit$summary(c("alpha_0"))[["ess_bulk"]],
+  main_fit$summary(c("tau"))[["ess_bulk"]],
+  main_fit$summary(c("alpha_j"))[["ess_bulk"]],
+  main_fit$summary(c("theta"))[["ess_bulk"]],
+  main_fit$summary(c("lambda"))[["ess_bulk"]],
+  main_fit$summary(c("new_infections_EpiStart"))[["ess_bulk"]],
+  main_fit$summary(c("phi_new_cases"))[["ess_bulk"]],
+  main_fit$summary(c("phi_new_infections"))[["ess_bulk"]],
+  main_fit$summary(c("mu_p_in"))[["ess_bulk"]],
+  main_fit$summary(c("sigma_p_in"))[["ess_bulk"]]) / 4000
+
+# Rhat
+par_est$rhat <- c(
+  main_fit$summary(c("alpha_0"))[["rhat"]],
+  main_fit$summary(c("tau"))[["rhat"]],
+  main_fit$summary(c("alpha_j"))[["rhat"]],
+  main_fit$summary(c("theta"))[["rhat"]],
+  main_fit$summary(c("lambda"))[["rhat"]],
+  main_fit$summary(c("new_infections_EpiStart"))[["rhat"]],
+  main_fit$summary(c("phi_new_cases"))[["rhat"]],
+  main_fit$summary(c("phi_new_infections"))[["rhat"]],
+   main_fit$summary(c("mu_p_in"))[["rhat"]],
+  main_fit$summary(c("sigma_p_in"))[["rhat"]])
+
+# Generate tex table
+par_est$par <- c("$\\alpha$", "$\\tau$", paste0("$\\alpha_{", 1:20, "}$"), paste0("$\\theta_", 1:7, "$"), 
+                 "$\\lambda$", paste0("$I_{", 1:20, "\\,", -33, "}$"), "$\\phi^N$", "$\\phi^I$", "$\\mu^{p_{IN}}$",  "$\\sigma^{p_{IN}}$")
+par_est <- dplyr::select(par_est, par, mean, lower, upper, neff_ratio, rhat)
+
+xtable::print.xtable(
+  file = "results/EstimationResults.tex",
+  xtable::xtable(
+    par_est
+  ),
+  only.contents = T,
+  include.colnames = F,
+  include.rownames = F,
+  sanitize.text.function = identity,
+  hline.after = NULL
+)
+```
+
+### Time from infection to reporting
+
+```{r}
+post_mu_p_in <- gather_draws(main_fit, mu_p_in) %>% ungroup()
+post_mu_p_in_pl <- ggplot() + 
+  geom_line(data = data.frame(x = seq(1, 5, .001), y = dnorm(seq(1, 5, .001), 2.5, 0.5)), mapping = aes(x = x, y = y), color = "skyblue3") +
+  geom_density(data = post_mu_p_in, mapping = aes(x = .value), col = "tomato3") +
+  geom_vline(aes(xintercept = mean(post_mu_p_in$.value)), col = "tomato3", linetype = "dashed") +
+  geom_vline(aes(xintercept = 2.5), col = "skyblue3", linetype = "dashed") +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 5), breaks = seq(0, 5, 1)) +
+  labs(x = expression(mu), y = "Density") +
+  theme_nature()
+post_mu_p_in_pl
+save_plot(post_mu_p_in_pl, pdf_file = "results/mu_p_in.pdf")
+
+post_sigma_p_in <- gather_draws(main_fit, sigma_p_in) %>% ungroup()
+sigma_p_in_pl <- ggplot() + 
+  geom_line(data = data.frame(x = seq(0, 2, .001), y = dgamma(seq(0, 2, .001), 2, 2 / 0.4)), mapping = aes(x = x, y = y), color = "skyblue3") +
+  geom_density(data = post_sigma_p_in, mapping = aes(x = .value), col = "tomato3") +
+  geom_vline(aes(xintercept = mean(post_sigma_p_in$.value)), col = "tomato3", linetype = "dashed") +
+  geom_vline(aes(xintercept = 0.4), col = "skyblue3", linetype = "dashed") +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), limits = c(0, 2), breaks = seq(0, 2, 0.4)) +
+  labs(x = expression(sigma), y = "Density") +
+  theme_nature()
+sigma_p_in_pl
+save_plot(sigma_p_in_pl, pdf_file = "results/sigma_p_in.pdf")
+
+posterior_p_in <- gather_draws(main_fit, p_in[x]) %>% 
+  ungroup() %>%
+  mutate(x = max(x) - x) %>%
+  dplyr::filter(x <= 30) %>%
+  group_by(x) %>%
+  summarize(.lower = quantile(.value, 0.025),
+            .upper = quantile(.value, 0.975),
+            .mean = mean(.value)) %>%
+  ungroup() 
+prior_p_in <- data_delay(xT = 30, from0 = T, p_in, mu = rnorm(4000, 2.5, 0.5), sigma = rgamma(4000, 2, 2 / 0.4)) %>%
+  group_by(x) %>%
+  summarize(.lower = quantile(value, 0.025),
+            .upper = quantile(value, 0.975),
+            .mean = mean(value)) %>%
+  ungroup() 
+  
+posterior_p_in_pl <- ggplot(data = rbind(posterior_p_in, prior_p_in) %>% mutate(type = rep(c("Posterior", "Prior"), each = 31)), 
+                             mapping = aes(x = x, y = .mean, ymin = .lower, ymax = .upper, color = type, fill = type)) +
+  geom_line(linetype = "dashed") +
+  geom_ribbon(alpha = 0.2, color = "white") +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_manual(values = c("tomato3", "skyblue3"), name = "") +
+  scale_color_manual(values = c("tomato3", "skyblue3"), name = "") +
+  labs(y = "Prob. to be reported", x = "Days post infection") +
+  theme_nature()
+posterior_p_in_pl
+save_plot(posterior_p_in_pl, pdf_file = "results/p_in.pdf")
+``` 
+
+### Influential observations
+
+```{r}
+main_loo_ll <- main_fit$draws("log_lik") %>% 
+    apply(3, na.omit) %>%
+    Filter(f = length) 
+loo_cid <- sapply(stringi::stri_extract_all(names(main_loo_ll), regex = "\\d{1,2}"), function(x) x[[2]])
+main_loo <- main_loo_ll %>% abind::abind(along = 3) %>% loo
+
+plot(main_loo) 
+
+loo_dat <- data.frame(country_id = as.numeric(loo_cid),
+                      date = as.Date(unlist(sapply(stanDat_main$date, function(x) as.character(x[(stanDat_main$EpiStart+1):length(x)])))),
+                      k = main_loo$diagnostics$pareto_k) %>%
+  left_join(cid_country)
+
+loo_pl <- loo_dat %>%
+  ggplot(aes(x = date, y = k)) +
+  geom_point(shape = 3) +
+  facet_wrap(~ country, ncol = 4, scales = "free_x") +
+  geom_hline(aes(yintercept = 0), linetype = "dashed", color = "black") +
+  geom_hline(aes(yintercept = 0.5), linetype = "dashed", color = "red") +
+  geom_hline(aes(yintercept = 0.7), linetype = "dashed", color = "red") +
+  scale_y_continuous(limits = c(min(loo_dat$k)-0.05, ifelse(max(loo_dat$k) > 1, max(loo_dat$k), 1)), breaks = c(0, 0.5, 0.7)) +
+  labs(y = "Pareto shape k", x = "Date") +
+  theme_nature() 
+
+save_plot(loo_pl, "results/influential_observations.pdf", w = 24, h = 20)
+```
+
+### Posterior pairs
+
+```{r}
+npi_main_theta <- npi_main %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) %>%
+  ungroup() %>%
+  mutate(.draw = rep(1:4000, 7)) %>%
+  dplyr::select(measure, .value, .draw) %>%
+  spread(measure, .value) %>%
+  dplyr::select(`School closure`, `Border closure`, `Event ban`, `Gathering ban`, `Venue closure`, `Stay-at-home order`, `Work ban`)
+
+cor(npi_main_theta) %>% round(2)
+
+corr_pl <- ggpairs(npi_main_theta, 
+                   lower = list(continuous = contours),
+                   diag = list(continuous = wrap(hist_fun)),
+                   upper = list(continuous = wrap(cor_fun, sz = text_size*5/14, stars = FALSE))) +
+  theme_nature()
+
+save_plot(corr_pl, pdf_file = "results/posterior_pairs.pdf", w = 20, h = 20)
+```
+
+
+## Sensitivity checks
+
+### Start of modeling phase
+
+```{r}
+rc_ModelStartCases10 <- readRDS("robustness-checks/fitted-models/rc_ModelStartCases_10.rds")
+rc_ModelStartCases50 <- readRDS("robustness-checks/fitted-models/rc_ModelStartCases_50.rds")
+
+npi_rc_ModelStartCases10 <- gather_draws(rc_ModelStartCases10, theta[measure])
+npi_rc_ModelStartCases50 <- gather_draws(rc_ModelStartCases50, theta[measure])
+
+npi_rc_ModelStartCases_pl <- plot_rc(list(npi_rc_ModelStartCases10, npi_rc_ModelStartCases50, npi_main), 
+                                     color_levs = c("10", "50", "100"), default = c(F, F, T), color_lab = "Cumulative cases until start of modeling phase")
+
+save_plot(npi_rc_ModelStartCases_pl, pdf_file = "robustness-checks/results/rc_ModelStartCases.pdf", w = 14, h = 11)
+
+remove(rc_ModelStartCases10, rc_ModelStartCases50)
+```
+
+### End of modeling phase
+
+```{r}
+rc_EpidemicEnd_1 <- readRDS("robustness-checks/fitted-models/rc_EpidemicEnd_21.rds")
+rc_EpidemicEnd_2 <- readRDS("robustness-checks/fitted-models/rc_EpidemicEnd_35.rds")
+
+npi_rc_EpidemicEnd_1 <- gather_draws(rc_EpidemicEnd_1, theta[measure]) 
+npi_rc_EpidemicEnd_2 <- gather_draws(rc_EpidemicEnd_2, theta[measure]) 
+
+npi_rc_EpidemicEnd_pl <- plot_rc(list(npi_rc_EpidemicEnd_1, npi_main, npi_rc_EpidemicEnd_2),
+                                 color_levs = c("21", "28", "35"), default = c(F, T, F), color_lab = "Days since last NPI until end of modeling phase")
+
+save_plot(npi_rc_EpidemicEnd_pl, pdf_file = "robustness-checks/results/rc_EpidemicEnd.pdf", w = 14, h = 11)
+
+remove(rc_EpidemicEnd_1, rc_EpidemicEnd_2)
+```
+
+
+### Splines
+
+```{r}
+rc_spline_1 <- readRDS("robustness-checks/fitted-models/rc_ta_-1_tb_1.rds")
+rc_spline_2 <- readRDS("robustness-checks/fitted-models/rc_tb_1.rds")
+rc_spline_3 <- readRDS("robustness-checks/fitted-models/rc_tb_5.rds")
+
+npi_rc_spline_1 <- gather_draws(rc_spline_1, theta[measure]) 
+npi_rc_spline_2 <- gather_draws(rc_spline_2, theta[measure]) 
+npi_rc_spline_3 <- gather_draws(rc_spline_3, theta[measure]) 
+
+npi_rc_spline <- plot_rc(list(npi_rc_spline_1, npi_rc_spline_2, npi_main, npi_rc_spline_3),
+                         color_levs = c("(-1,1)", "(0,1)", "(0,3)", "(1,5)"), default = c(F, F, T, F), color_lab = expression("First-order spline: FOS(t"[0]*", t"[1]*")")) 
+
+save_plot(npi_rc_spline, pdf_file = "robustness-checks/results/rc_spline.pdf", w = 14, h = 13)
+
+remove(rc_spline_1, rc_spline_2, rc_spline_3)
+```
+
+### Prior for theta_m
+
+```{r}
+rc_theta_1 <- readRDS("robustness-checks/fitted-models/rc_theta_mix_0.3.rds")
+rc_theta_2 <- readRDS("robustness-checks/fitted-models/rc_theta_mix_0.5.rds")
+
+npi_rc_theta_1 <- gather_draws(rc_theta_1, theta[measure]) 
+npi_rc_theta_2 <- gather_draws(rc_theta_2, theta[measure]) 
+
+npi_rc_theta <- plot_rc(list(npi_main, npi_rc_theta_1, npi_rc_theta_2), 
+                        color_levs = c("10", "30", "50"), default = c(T, F, F), color_lab = "Prior probability of a negative effect of NPIs (%)") 
+
+save_plot(npi_rc_theta, pdf_file = "robustness-checks/results/rc_theta.pdf", w = 14, h = 11)
+
+remove(rc_theta_1, rc_theta_2)
+```
+
+
+### p_IN: Distribution for the time from infection to reporting
+
+```{r}
+par_p_in_est <- expand.grid(mu_mu0 = c(eval(formals(p_in)$mu) - 0.25, eval(formals(p_in)$mu), eval(formals(p_in)$mu) + 0.25), 
+                            sigma_beta0 = c(eval(formals(p_in)$sigma) - 0.2, eval(formals(p_in)$sigma), eval(formals(p_in)$sigma) + 0.2))
+par_p_in_est$mu_sigma0 <- 0.5
+par_p_in_est$sigma_alpha0 <- 2
+par_p_in_est_spec <- c()
+npi_rc_p_in_est <- list()
+for (i in 1:nrow(par_p_in_est)) {
+  f <- paste0("robustness-checks/fitted-models/rc_p_in_mu_mu0_", round(par_p_in_est$mu_mu0[i], 2), "_p_in_mu_sigma0_", round(par_p_in_est$mu_sigma0[i], 2), 
+              "_p_in_sigma_alpha0_", round(par_p_in_est$sigma_alpha0[i], 2), "_p_in_sigma_beta0_", round(par_p_in_est$sigma_beta0[i], 2), ".rds")
+  par_p_in_est_spec[i] <- paste0("(Normal(", round(par_p_in_est$mu_mu0[i], 2), ", ", round(par_p_in_est$mu_sigma0[i], 2), "),\n",
+                                 "Gamma(", round(par_p_in_est$sigma_alpha0[i], 2), ", ", round(par_p_in_est$sigma_beta0[i], 2), "))")
+  npi_rc_p_in_est[[i]] <- gather_draws(readRDS(f), theta[measure]) 
+}
+
+npi_rc_p_in <- plot_rc(npi_rc_p_in_est, 
+                        color_levs = par_p_in_est_spec, default = c(F, F, F, F, T, F, F, F, F),
+                        color_lab = expression("p"[IN]*" ~ Lognormal("*mu*", "*sigma*")")) +
+  theme(legend.spacing.y = unit(-0.25, "cm")) +
+  guides(color = guide_legend(ncol = 3, byrow = T, override.aes = list(linetype = c(rep("solid", 4), "dashed", rep("solid", 4)))))
+         
+save_plot(npi_rc_p_in, pdf_file = "robustness-checks/results/rc_p_in_estimated.pdf", w = 14, h = 20)
+```
+
+### p_G: Generation time distribution
+
+```{r}
+par_p_g <- expand.grid(par1 = c(eval(formals(p_g)$p1) - 0.5, eval(formals(p_g)$p1), eval(formals(p_g)$p1) + 0.5),
+                       par2 = c(eval(formals(p_g)$p2) - 1, eval(formals(p_g)$p2), eval(formals(p_g)$p2) + 1))
+p_g_spec <- c()
+npi_rc_p_g <- list()
+for (i in 1:nrow(par_p_g)) {
+  f <- paste0("robustness-checks/fitted-models/rc_par1_p_g_", round(par_p_g$par1[i], 2), "_par2_p_g_", round(par_p_g$par2[i], 2), ".rds")
+  p_g_spec[i] <- paste0("(", round(par_p_g$par1[i], 2), ", ", round(par_p_g$par2[i], 2), ")")
+  npi_rc_p_g[[i]] <- gather_draws(readRDS(f), theta[measure]) 
+}
+
+npi_rc_p_g_pl <- plot_rc(npi_rc_p_g, 
+                          color_levs = p_g_spec, default = c(F, F, F, F, T, F, F, F, F),
+                          color_lab = expression(p[G]*" ~ Gamma("*mu*", "*sigma*")")) +
+  theme(legend.spacing.y = unit(-0.25, "cm")) +
+  guides(color = guide_legend(ncol = 3, byrow = T, override.aes = list(linetype = c(rep("solid", 4), "dashed", rep("solid", 4)))))
+
+save_plot(npi_rc_p_g_pl, pdf_file = "robustness-checks/results/rc_p_g.pdf", w = 14, h = 20)
+```
+
+### LOO country analysis
+
+```{r}
+# Load model and retrieve loo country theta estimates
+loo_dat <- list()
+for (cid in 1:max(df_pp$country_id)) {
+  print(sprintf("Country %i | 20", cid))
+  cid_fit <- readRDS(paste0("robustness-checks/fitted-models/rc_loo_", cid, ".rds"))
+  loo_dat[[cid]] <- gather_draws(cid_fit, theta[measure])
+  remove(cid_fit)
+}
+loo_dat <- do.call(rbind, loo_dat)
+loo_dat <- loo_dat %>%
+  ungroup() %>%
+  mutate(country_id = as.numeric(rep(1:20, each = 7 * 4000)))  %>%
+  left_join(cid_country, by = "country_id") %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) 
+
+# Add degree to which NPIs were imposed by country
+imposed_npis <- df_pp %>%
+  dplyr::select(country, schools, borders, events, 
+                gatherings, venues, lockdown, homeoffice) %>%
+  set_names(c("country", npi_names)) %>%
+  group_by(country) %>%
+  summarize_all(max) %>%
+  ungroup() %>%
+  reshape2::melt(id.vars = "country") %>%
+  rename(is_imposed = value, measure = variable)
+  
+loo_dat <- loo_dat %>% 
+  dplyr::select(-country_id) %>%
+  left_join(imposed_npis, by = c("country", "measure")) %>%
+  mutate(measure = factor(measure, level = npi_names))
+
+# Global estimate
+global_dat <- npi_main %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) %>%
+  mutate(country = "Global")
+
+# Plot
+loo_dat_pl <- loo_dat %>%
+  ggplot(aes(x = .value, y = country)) + # , color = is_imposed
+  stat_pointintervalh(point_interval = ci_interval, position =  
+                      ggstance::position_dodgev(height = .5), 
+                      point_size = 1) +
+  facet_wrap(~ measure, ncol = 3) +
+  stat_pointintervalh(data = global_dat, mapping = aes(x = .value, y = country), color = "black",
+                      point_interval = ci_interval, position =  
+                      ggstance::position_dodgev(height = .5), 
+                      point_size = 1) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed", color = "red") +
+  scale_x_continuous(limits = c(NA,.7), labels = function(x) x * 100) +
+  #scale_color_continuous(labels = function(x) x * 100) +
+  labs(x = "Estimated reduction in new cases (%)", y = "Left-out country") + #, color = "Maximum cumulative share \n of population affected (%)") +
+  theme_nature() +
+  theme(legend.position = c(0.6, 0.15), legend.direction = "horizontal") 
+  
+save_plot(loo_dat_pl, "robustness-checks/results/rc_loo_country.pdf", w = 14, h = 18)
+```
+
+#### Split Australia
+
+```{r}
+rc_SeparateRegions_looA1 <- readRDS("robustness-checks/fitted-models/rc_separate_regions_loo_EA.rds")
+rc_SeparateRegions_looA2 <- readRDS("robustness-checks/fitted-models/rc_separate_regions_loo_WA.rds")
+
+npi_rc_SeparateRegions_looA1 <- gather_draws(rc_SeparateRegions_looA1, theta[measure])
+npi_rc_SeparateRegions_looA2 <- gather_draws(rc_SeparateRegions_looA2, theta[measure])
+
+npi_rc_SeparateRegions_loo_pl <- plot_rc(list(npi_main, npi_rc_SeparateRegions_looA1, npi_rc_SeparateRegions_looA2), 
+                                     color_levs = c("None", "Eastern Australia", "Western Australia"), default = c(T, F, F), color_lab = "Left-out region")
+
+save_plot(npi_rc_SeparateRegions_loo_pl, pdf_file = "robustness-checks/results/rc_SeparateRegions_looA1A2.pdf", w = 14, h = 11)
+
+remove(rc_SeparateRegions_looA1, rc_SeparateRegions_looA2)
+```
+

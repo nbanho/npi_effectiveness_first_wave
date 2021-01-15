@@ -1,0 +1,274 @@
+---
+title: "Comparison with Brauner et al"
+author: "Nicolas Banholzer"
+date: "12/18/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+
+```{r cars}
+library(tidyverse)
+library(lubridate)
+
+source("../utils/covid.R")
+source("../utils/tex.R")
+source("../utils/plotting.R")
+source("../utils/bayes.R")
+```
+
+## Data
+
+```{r pressure, echo=FALSE}
+# Load and preprocess data by Brauner et al.
+DFB <- read_csv("brauner.csv") %>%
+  rename(date = Date, country = `Region Name`, cases = Confirmed) %>%
+  dplyr::select(-`Mask Wearing`, -`Travel Screen/Quarantine`, -`Travel Bans`, -`Public Transport Limited`, 
+                -`Internal Movement Limited`, -`Public Information Campaigns`, -`Symptomatic Testing`,
+                -Active, -Deaths, -`Country Code`) %>%
+  group_by(country) %>%
+  arrange(date) %>%
+  mutate(new_cases = dplyr::lead(cases) - cases) %>%
+  mutate(new_cases = ifelse(new_cases < 0, floor(0.5 * (dplyr::lead(new_cases) + dplyr::lag(new_cases))), new_cases)) %>% # impute negs
+  mutate(cases = dplyr::lag(cumsum(new_cases))) %>%
+  slice(1:(n()-1)) %>%
+  ungroup() %>%
+  dplyr::filter(date <= '2020-05-30') 
+
+country_id <- DFB %>%
+  group_by(country) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(country_id = 1:nrow(.)) %>%
+  dplyr::select(country, country_id)
+
+DFB <- left_join(DFB, country_id) %>%
+  dplyr::select(country_id, country, date, cases, everything())
+
+npi_names <- c("Gatherings <1000", "Gatherings <100", "Gatherings <10", "Some Businesses Suspended", "Most Businesses Suspended", 
+               "School Closure", "University Closure", "Stay Home Order")
+
+# Generate data that can be provided to our Stan model
+stanDatDFB <- make_stan_dat(dat = DFB, npis = npi_names, EpidemicEnd = NULL)
+```
+
+## Descriptives
+
+Comparing the encoding, i.e., the implementation dates of NPIs.
+
+```{r}
+ETH <- read_csv("../data/data_preprocessed.csv") 
+
+ETH_NPI <- ETH %>%
+  dplyr::select(country, date, events, schools, gatherings, venues, lockdown, homeoffice) %>%
+  set_names(c("country", "date", "Event ban", "School closure", "Gathering ban", "Venue closure", "Stay-home order", "Work ban")) %>%
+  reshape2::melt(id.vars = c("country", "date")) %>%
+  mutate(date = as.character(date)) %>%
+  group_by(country, variable) %>%
+  summarize(date = ifelse(all(value < 0.5), NA, date[which(value >= 0.5)[1]])) %>%
+  ungroup() %>%
+  mutate(date = as.Date(date))
+
+npi_names_alt <- c("Event ban", "Gathering ban", "Venue closure", "Work ban", "School closure", "Stay-home order")
+names(npi_names_alt) <- c("Gatherings <1000", "Gatherings <10", "Some Businesses Suspended", "Most Businesses Suspended", "School Closure", "Stay Home Order")
+
+DFB_NPI <- DFB %>%
+  dplyr::select(all_of(c("country", "date", unname(npi_names)))) %>%
+  dplyr::select(-`Gatherings <100`, -`University Closure`) %>%
+  reshape2::melt(id.vars = c("country", "date")) %>%
+  mutate(date = as.character(date)) %>%
+  mutate(variable = recode(variable, !!! npi_names_alt)) %>%
+  group_by(country, variable) %>%
+  summarize(date = ifelse(all(value < 0.5), NA, date[which(value >= 0.5)[1]])) %>%
+  ungroup() %>%
+  mutate(date = as.Date(date))
+
+BOTH_NPI <- DFB_NPI %>%
+  dplyr::filter(country %in% ETH_NPI$country) %>%
+  left_join(ETH_NPI, by = c("country", "variable")) %>%
+  mutate(date_diff = as.numeric(difftime(date.y, date.x, units = "days"))) %>%
+  set_names(c("Country", "NPI", "Brauner's date", "Our date", "Difference (days)"))
+
+xlsx::write.xlsx(BOTH_NPI, file = "results_comparison_brauner/npi_comparison_B.xlsx", sheetName = "Comparison")
+
+npi_comp_hist <- ggplot(BOTH_NPI, aes(x = `Difference (days)`)) +
+  facet_wrap(~ NPI) +
+  geom_histogram(col = "white") +
+  geom_vline(aes(xintercept = 0), col = "red", linetype = "dashed") +
+  labs(x = "Difference in days between us and Brauner", y = "Frequency") +
+  theme_nature()
+
+npi_comp_hist
+
+save_plot(npi_comp_hist, pdf_file = "results_comparison_brauner/npi_comparison_hist_B.pdf", w = 15, h = 10)
+```
+
+
+## Model
+
+```{r}
+# Fit our model to the data from Brauner et al.
+main_B <- cmdstanr::cmdstan_model("../models/sim_g.stan", cpp_options = list(stan_threads = T))
+main_B_fit <- main_B$sample(
+  data =  stan_dat_omit(stanDatDFB),
+  seed = 12345,
+  chains = 4, 
+  iter_warmup = 1000, 
+  iter_sampling = 1000,
+  parallel_chains = 4,
+  threads_per_chain = 2, 
+  refresh = 200,
+  max_treedepth = 15,
+  adapt_delta = 0.9
+)
+main_B_fit$save_object(file = "robustness-checks/base_B.rds")
+```
+
+```{r}
+# Check some parameters
+main_B_fit$summary(c("lambda", "alpha_0", "phi_new_cases", "phi_new_infections", "mu_p_in", "sigma_p_in", "theta"))
+
+# NPI names
+npi_var <- as.character(1:length(npi_names))
+names(npi_names) <- npi_var
+
+# Country x Country ID mapping
+cid_country <- DFB %>% group_by(country) %>% slice(1) %>% ungroup %>% dplyr::select(country, country_id)
+
+# Choose credible interval for reporting
+ci_interval <- mean_qi
+```
+
+
+## Results
+
+### Model fit
+
+```{r}
+expected_B_N <- gather_draws(main_B_fit, E_new_cases_rep[day, country])
+expected_B_I <- gather_draws(main_B_fit, E_new_infections_rep[day, country])
+
+pdf("results_comparison_brauner/compartments_B.pdf", width = 12 / cm(1), height = 10 / cm(1))
+for (i in cid_country$country_id) {
+  print(plot_compartments(cid_country$country[i], stanDatDFB, expected_B_N, expected_B_I, npi_labs = c("G1", "G2", "G3", "V", "W", "S", "U", "H")))
+}
+dev.off()
+```
+
+### NPI effects
+
+```{r}
+npi_B_main <- gather_draws(main_B_fit, theta[measure]) %>% ungroup() 
+
+npi_B_main_sum <- npi_B_main %>%
+  mutate(measure = ifelse(measure == 3, 2, measure)) %>%
+  mutate(measure = ifelse(measure == 7, 6, measure)) %>%
+  mutate(measure = recode(as.character(measure), !!! npi_names)) %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup() %>%
+  group_by(measure) %>%
+  ci_interval() %>%
+  ungroup() %>%
+  arrange(desc(.value)) %>%
+  mutate_if(is.numeric, function(x) round(x * 100)) %>%
+  dplyr::select(measure, .value, .lower, .upper)
+
+npi_B_main_sum
+
+npi_ranking <- 1:nrow(npi_B_main_sum)
+names(npi_ranking) <- npi_B_main_sum$measure
+
+npi_B_pl <- npi_B_main %>%
+  mutate(measure = as.factor(recode(as.character(measure), !!! npi_names))) %>%
+  rename(reduction = .value) %>%
+  ggplot(aes(y = reorder(measure, reduction), x = reduction)) +
+  stat_pointintervalh(point_interval = ci_interval, shape = 21, fill = "grey", color = "black", point_size = 2) +
+  geom_vline(aes(xintercept = 0), color = "red", linetype = "dotted") +
+  scale_x_continuous(expand = c(0,0), limits = c(NA, .7), labels = function(x) x * 100, breaks = seq(0,  1, .25)) +
+  labs(x = "Estimated reduction in new infections (\\%)",
+       y = "NPI") +
+  theme_nature() +
+  theme(axis.title.y = element_blank())
+
+save_plot(npi_B_pl, "results_comparison_brauner/npi_effects_B.pdf", w = 10, h = 6)
+
+gathering2 <- npi_B_main %>%
+  dplyr::filter(measure %in% c(1,2)) %>%
+  mutate(measure = 2) %>%
+  group_by(measure)  %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup()
+gathering3 <- npi_B_main %>%
+  dplyr::filter(measure %in% c(1,2,3)) %>%
+  mutate(measure = 3) %>%
+  group_by(measure)  %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup()
+businesses <- npi_B_main %>%
+  dplyr::filter(measure %in% c(4,5)) %>%
+  mutate(measure = 5) %>%
+  group_by(measure)  %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup()
+schools <- npi_B_main %>%
+  dplyr::filter(measure %in% c(6,7)) %>%
+  mutate(measure = 6) %>%
+  group_by(measure)  %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup()
+npi_B_main_cum <- rbind(
+  npi_B_main %>% dplyr::filter(measure == 1) %>% dplyr::select(measure, .draw, .value),
+  gathering2,
+  gathering3,
+  npi_B_main %>% dplyr::filter(measure == 4) %>% dplyr::select(measure, .draw, .value),
+  businesses,
+  schools, 
+  npi_B_main %>% dplyr::filter(measure == 8) %>% dplyr::select(measure, .draw, .value)
+)
+
+npi_B_main_cum_sum <- npi_B_main_cum %>%
+  mutate(measure = recode(as.character(measure), !!! npi_names)) %>%
+  group_by(measure) %>%
+  ci_interval() %>%
+  ungroup() %>%
+  arrange(desc(.value)) %>%
+  mutate_if(is.numeric, function(x) round(x * 100)) %>%
+  dplyr::select(measure, .value, .lower, .upper)
+
+npi_B_main_cum_sum
+```
+
+### Posterior pairs
+
+```{r}
+npi_main_B_theta <- npi_B_main %>%
+  mutate(measure = ifelse(measure == 7, 6, measure)) %>%
+  group_by(measure, .draw) %>%
+  summarize(.value = sum(.value)) %>%
+  ungroup() %>%
+  mutate(measure = recode(as.character(measure), !!! npi_names)) %>%
+  ungroup() %>%
+  mutate(.draw = rep(1:4000, 7)) %>%
+  dplyr::select(measure, .value, .draw) %>%
+  spread(measure, .value) %>%
+  dplyr::select(all_of(unname(npi_names[-7])))
+
+cor(npi_main_B_theta) %>% round(2)
+
+corr_B_pl <- ggpairs(npi_main_B_theta, 
+                   lower = list(continuous = contours),
+                   diag = list(continuous = wrap(hist_fun)),
+                   upper = list(continuous = wrap(cor_fun, sz = text_size*5/14, stars = FALSE))) +
+  theme_nature()
+
+save_plot(corr_B_pl, pdf_file = "results_comparison_brauner/posterior_pairs_B.pdf", w = 20, h = 20)
+```
