@@ -1,9 +1,10 @@
-This repository provides data and code for the paper on ``Estimating the effects of non-pharmaceutical interventions on the number of new infections with COVID-19 during the first epidemic wave''.
+Data and code from the paper "Estimating the effects of non-pharmaceutical interventions on the number of new infections with COVID-19 during the first epidemic wave" by Banholzer et al.
 
-- A preprocessed data file is in the `data` folder.
-- The model code can be found in `models/sim-g.stan`.
+*Structure of the repository*:
+- A preprocessed data file is in the `data/data_preprocessed.csv`.
+- The Stan model code is in `models/sim-g.stan`.
 - The default model can be run with `run_base.r`.
-- All models for the sensitivity analysis are run with `robustness-checsk\run_rc.r`.
-- After running the model(s), the results can be analyzed with `analysis.Rmd`. 
-- A comparison with a similar study is included and can be run and analyzed with `robustness-checks/comparison_with_brauner.rmd`. 
+- All models for the sensitivity analysis can be run with `robustness-checsk\run_rc.r`.
+- After running the model(s), the results presented in the paper can be reproduced with `analysis.Rmd`. 
+- A comparison with a similar study is included and can be run and reproduced with `robustness-checks/comparison_with_brauner.rmd`. 
 
